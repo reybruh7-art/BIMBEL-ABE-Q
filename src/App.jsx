@@ -12,9 +12,10 @@ import {
   Copy,
   ArrowRight,
   BookOpen,
-  Filter,
   UserCheck
 } from 'lucide-react';
+import { db } from './firebase';
+import { collection, onSnapshot, addDoc, deleteDoc, doc, serverTimestamp } from 'firebase/firestore';
 
 const SESSIONS = [
   { id: 1, time: '08:00 - 09:00', label: 'Sesi 1' },
@@ -30,22 +31,19 @@ const MAX_CAPACITY = 10;
 const ADMIN_PHONE = '6285218890126';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('booking'); // booking, parent, admin
-  const [bookings, setBookings] = useState(() => {
-    const saved = localStorage.getItem('abeq_bookings');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [activeTab, setActiveTab] = useState('booking');
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
 
   // Form Booking
-  const [selectedDate, setSelectedDate] = useState(() => {
-    return new Date().toISOString().split('T')[0];
-  });
+  const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split('T')[0]);
   const [selectedSession, setSelectedSession] = useState(null);
   const [childName, setChildName] = useState('');
   const [grade, setGrade] = useState('SD123');
   const [parentPhone, setParentPhone] = useState('');
   const [lastBooking, setLastBooking] = useState(null);
   const [copiedRek, setCopiedRek] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
   // Portal Ortu
   const [searchParentPhone, setSearchParentPhone] = useState('');
@@ -59,16 +57,28 @@ export default function App() {
   const [adminSearch, setAdminSearch] = useState('');
   const [adminGradeFilter, setAdminGradeFilter] = useState('ALL');
 
+  // Real-time listener: Kuota langsung tersinkron di semua HP tanpa reload
   useEffect(() => {
-    localStorage.setItem('abeq_bookings', JSON.stringify(bookings));
-  }, [bookings]);
+    const unsub = onSnapshot(collection(db, 'bookings'), (snapshot) => {
+      const docs = snapshot.docs.map(d => ({
+        id: d.id,
+        ...d.data()
+      }));
+      setBookings(docs);
+      setLoading(false);
+    }, (error) => {
+      console.error("Firestore Error:", error);
+      setLoading(false);
+    });
 
-  // Hitung Kuota per Sesi
+    return () => unsub();
+  }, []);
+
   const getSessionCount = (date, sessionId) => {
-    return bookings.filter(b => b.date === date && b.sessionId === sessionId).length;
+    return bookings.filter(b => b.date === date && Number(b.sessionId) === Number(sessionId)).length;
   };
 
-  const handleBookingSubmit = (e) => {
+  const handleBookingSubmit = async (e) => {
     e.preventDefault();
     if (!selectedSession || !childName.trim() || !parentPhone.trim()) {
       alert('Mohon lengkapi semua kolom formulir!');
@@ -77,32 +87,39 @@ export default function App() {
 
     const currentCount = getSessionCount(selectedDate, selectedSession.id);
     if (currentCount >= MAX_CAPACITY) {
-      alert('Maaf, kuota untuk sesi ini baru saja penuh!');
+      alert('Maaf, kuota untuk sesi ini baru saja terisi penuh!');
       return;
     }
 
-    // Standardisasi No WA
     let cleanPhone = parentPhone.replace(/\D/g, '');
     if (cleanPhone.startsWith('0')) cleanPhone = '62' + cleanPhone.slice(1);
     if (!cleanPhone.startsWith('62')) cleanPhone = '62' + cleanPhone;
 
-    const newBooking = {
-      id: 'REG-' + Date.now().toString().slice(-6),
-      date: selectedDate,
-      sessionId: selectedSession.id,
-      sessionTime: selectedSession.time,
-      childName: childName.trim(),
-      grade,
-      parentPhone: cleanPhone,
-      createdAt: new Date().toISOString()
-    };
+    setSubmitting(true);
+    try {
+      const regId = 'REG-' + Date.now().toString().slice(-6);
+      const bookingData = {
+        regCode: regId,
+        date: selectedDate,
+        sessionId: selectedSession.id,
+        sessionTime: selectedSession.time,
+        childName: childName.trim(),
+        grade,
+        parentPhone: cleanPhone,
+        createdAt: new Date().toISOString(),
+        serverTimestamp: serverTimestamp()
+      };
 
-    setBookings(prev => [...prev, newBooking]);
-    setLastBooking(newBooking);
-    
-    // Reset Form Input
-    setChildName('');
-    setSelectedSession(null);
+      const docRef = await addDoc(collection(db, 'bookings'), bookingData);
+      setLastBooking({ ...bookingData, id: docRef.id });
+      setChildName('');
+      setSelectedSession(null);
+    } catch (err) {
+      alert('Terjadi kendala saat menyimpan. Pastikan internet aktif.');
+      console.error(err);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const copyToClipboard = (text) => {
@@ -116,7 +133,7 @@ export default function App() {
     let query = searchParentPhone.replace(/\D/g, '');
     if (query.startsWith('0')) query = '62' + query.slice(1);
     
-    const results = bookings.filter(b => b.parentPhone.includes(query));
+    const results = bookings.filter(b => b.parentPhone && b.parentPhone.includes(query));
     setParentResults(results);
   };
 
@@ -135,9 +152,9 @@ export default function App() {
       return;
     }
 
-    const headers = ['ID Pendaftaran,Tanggal,Sesi (Jam),Nama Anak,Jenjang,No WA Ortu,Waktu Daftar'];
+    const headers = ['ID Reg,Tanggal,Sesi Jam,Nama Anak,Jenjang,No WA Ortu,Waktu Daftar'];
     const rows = bookings.map(b => 
-      `"${b.id}","${b.date}","${b.sessionTime}","${b.childName}","${b.grade}","${b.parentPhone}","${new Date(b.createdAt).toLocaleString('id-ID')}"`
+      `"${b.regCode || b.id}","${b.date}","${b.sessionTime}","${b.childName}","${b.grade}","${b.parentPhone}","${new Date(b.createdAt).toLocaleString('id-ID')}"`
     );
 
     const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + [headers, ...rows].join('\n');
@@ -150,20 +167,22 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  const deleteBooking = (id) => {
-    if (confirm('Yakin ingin membatalkan/menghapus pendaftaran ini?')) {
-      setBookings(prev => prev.filter(b => b.id !== id));
+  const deleteBooking = async (docId) => {
+    if (confirm('Yakin ingin membatalkan pendaftaran ini? Sisa kuota akan langsung bertambah.')) {
+      try {
+        await deleteDoc(doc(db, 'bookings', docId));
+      } catch (err) {
+        alert('Gagal menghapus data.');
+      }
     }
   };
 
-  // Batas Maksimal Tanggal Akhir Tahun
   const currentYear = new Date().getFullYear();
   const maxDate = `${currentYear}-12-31`;
   const minDate = new Date().toISOString().split('T')[0];
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
-      {/* Header & Navigasi */}
       <header className="bg-indigo-600 text-white shadow-md sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
           <div className="flex items-center gap-2">
@@ -203,14 +222,17 @@ export default function App() {
         </div>
       </header>
 
-      {/* Konten Utama */}
       <main className="flex-1 max-w-6xl w-full mx-auto p-4 sm:p-6">
-        
-        {/* TAB 1: FORM PENDAFTARAN JADWAL */}
+        {loading && (
+          <div className="p-3 mb-4 bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs rounded-xl text-center">
+            Menghubungkan ke database real-time...
+          </div>
+        )}
+
+        {/* TAB 1: FORM BOOKING */}
         {activeTab === 'booking' && (
           <div>
             {lastBooking ? (
-              /* Laman Konfirmasi & Pembayaran */
               <div className="max-w-2xl mx-auto bg-white rounded-2xl shadow-xl border border-emerald-100 overflow-hidden">
                 <div className="bg-emerald-500 text-white p-6 text-center">
                   <CheckCircle className="w-16 h-16 mx-auto mb-2 text-white animate-bounce" />
@@ -219,13 +241,12 @@ export default function App() {
                 </div>
 
                 <div className="p-6 space-y-6">
-                  {/* Detail Sesi */}
                   <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
                     <h3 className="font-semibold text-slate-700 mb-3 border-b pb-2">Rincian Pendaftaran:</h3>
                     <div className="grid grid-cols-2 gap-3 text-sm">
                       <div>
                         <span className="text-slate-500 block">ID Registrasi</span>
-                        <span className="font-bold text-indigo-600">{lastBooking.id}</span>
+                        <span className="font-bold text-indigo-600">{lastBooking.regCode || lastBooking.id}</span>
                       </div>
                       <div>
                         <span className="text-slate-500 block">Nama Anak</span>
@@ -242,12 +263,11 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Tombol Konfirmasi WA Langsung */}
                   <div className="text-center">
                     <a
                       href={`https://wa.me/${ADMIN_PHONE}?text=${encodeURIComponent(
                         `Halo Admin Bimbel ABE-Q, saya ingin konfirmasi pendaftaran sesi belajar.\n\n` +
-                        `*No Registrasi:* ${lastBooking.id}\n` +
+                        `*No Registrasi:* ${lastBooking.regCode || lastBooking.id}\n` +
                         `*Nama Anak:* ${lastBooking.childName}\n` +
                         `*Jenjang:* ${lastBooking.grade}\n` +
                         `*Tanggal:* ${lastBooking.date}\n` +
@@ -262,21 +282,18 @@ export default function App() {
                       <Phone className="w-5 h-5" />
                       Konfirmasi Jadwal via WhatsApp Admin
                     </a>
-                    <p className="text-xs text-slate-500 mt-2">Kirim bukti atau sapa admin secara langsung via chat WhatsApp.</p>
                   </div>
 
-                  {/* Opsi Pembayaran (Opsional, Jadwal Sudah Terkunci) */}
                   <div className="border-t pt-5">
                     <div className="bg-amber-50 border-l-4 border-amber-400 p-3 mb-4 rounded-r">
                       <p className="text-xs text-amber-800 font-medium">
-                        *Catatan: Jadwal Anda sudah terkunci. Opsi pembayaran di bawah dapat diselesaikan sebelum sesi dimulai.
+                        *Catatan: Jadwal Anda sudah terkunci. Opsi pembayaran di bawah dapat diselesaikan sebelum sesi belajar dimulai.
                       </p>
                     </div>
 
                     <h4 className="font-bold text-slate-800 mb-3">Pilihan Rekening & QRIS Pembayaran:</h4>
                     
                     <div className="grid sm:grid-cols-2 gap-4">
-                      {/* BCA */}
                       <div className="border rounded-xl p-4 bg-slate-50 flex flex-col justify-between">
                         <div>
                           <span className="inline-block bg-blue-600 text-white text-xs font-bold px-2 py-0.5 rounded">BANK BCA</span>
@@ -292,7 +309,6 @@ export default function App() {
                         </button>
                       </div>
 
-                      {/* QRIS */}
                       <div className="border rounded-xl p-4 bg-slate-50 text-center flex flex-col items-center">
                         <span className="inline-block bg-rose-600 text-white text-xs font-bold px-2 py-0.5 rounded mb-2">QRIS RESMI</span>
                         <p className="text-xs font-bold text-slate-700">BIMBEL ABE-Q, BGR UTR</p>
@@ -304,7 +320,6 @@ export default function App() {
                             className="w-32 h-32 object-contain mx-auto"
                           />
                         </div>
-                        <p className="text-[10px] text-slate-500 mt-2">Dapat di-scan via GoPay, OVO, Dana, BCA, Livin, dll.</p>
                       </div>
                     </div>
                   </div>
@@ -320,9 +335,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              /* Formulir Pemilihan Sesi */
               <div className="grid lg:grid-cols-3 gap-6">
-                {/* Kolom Kiri: Kalender Tanggal & Info */}
                 <div className="lg:col-span-1 space-y-4">
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <label className="block text-sm font-bold text-slate-700 mb-2 flex items-center gap-2">
@@ -341,29 +354,26 @@ export default function App() {
                       className="w-full p-3 rounded-xl border border-slate-300 focus:ring-2 focus:ring-indigo-500 font-semibold text-slate-700 outline-none"
                     />
                     <p className="text-xs text-slate-500 mt-2">
-                      Jadwal dapat dipilih hingga akhir tahun (31 Desember {currentYear}).
+                      Jadwal tersedia hingga 31 Desember {currentYear}.
                     </p>
                   </div>
 
                   <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl text-xs text-indigo-900 space-y-2">
                     <h4 className="font-bold flex items-center gap-1.5">
-                      <AlertCircle className="w-4 h-4 text-indigo-600" /> Aturan Kuota Sesi:
+                      <AlertCircle className="w-4 h-4 text-indigo-600" /> Sinkronisasi Real-Time:
                     </h4>
-                    <p>• Maksimal <strong>10 anak per sesi</strong> demi efektivitas belajar.</p>
-                    <p>• Tombol sesi otomatis berwarna abu-abu & terkunci jika kuota telah mencapai 10 anak.</p>
-                    <p>• Selesai mengisi, jadwal anak langsung resmi terkunci di sistem.</p>
+                    <p>• Maksimal <strong>10 anak per sesi</strong>.</p>
+                    <p>• Kuota terhubung langsung secara online, tombol otomatis abu-abu & terkunci jika sudah 10 anak.</p>
                   </div>
                 </div>
 
-                {/* Kolom Kanan: Pilihan 7 Sesi & Form Identitas */}
                 <div className="lg:col-span-2 space-y-6">
-                  {/* Pilihan 7 Sesi */}
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <h3 className="text-base font-bold text-slate-800 mb-1 flex items-center gap-2">
                       <Clock className="w-5 h-5 text-indigo-600" />
                       Pilih Sesi Jam (Tanggal: {selectedDate})
                     </h3>
-                    <p className="text-xs text-slate-500 mb-4">Tersedia 7 sesi per hari (1 jam per sesi):</p>
+                    <p className="text-xs text-slate-500 mb-4">Pilih salah satu sesi yang masih tersedia:</p>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       {SESSIONS.map((sess) => {
@@ -377,7 +387,7 @@ export default function App() {
                             type="button"
                             disabled={isFull}
                             onClick={() => setSelectedSession(sess)}
-                            className={`p-3.5 rounded-xl border text-left transition flex justify-between items-center relative overflow-hidden ${
+                            className={`p-3.5 rounded-xl border text-left transition flex justify-between items-center relative ${
                               isFull 
                                 ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
                                 : isSelected 
@@ -398,11 +408,11 @@ export default function App() {
                                 {isFull ? (
                                   <span className="text-rose-500 font-bold">PENUH (10/10)</span>
                                 ) : (
-                                  <span className="text-slate-500">Sisa Kuota: <strong className="text-indigo-600">{MAX_CAPACITY - filled} anak</strong></span>
+                                  <span className="text-slate-500">Sisa Kursi: <strong className="text-indigo-600">{MAX_CAPACITY - filled} anak</strong></span>
                                 )}
                               </div>
                             </div>
-                            <div className="text-right">
+                            <div>
                               {isFull ? (
                                 <Lock className="w-5 h-5 text-slate-400" />
                               ) : isSelected ? (
@@ -417,7 +427,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Form Identitas */}
                   <form onSubmit={handleBookingSubmit} className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200 space-y-4">
                     <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
                       <Users className="w-5 h-5 text-indigo-600" />
@@ -462,19 +471,18 @@ export default function App() {
                         onChange={(e) => setParentPhone(e.target.value)}
                         className="w-full p-2.5 rounded-lg border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
                       />
-                      <span className="text-[11px] text-slate-400">Nomor ini berguna untuk pengecekan jadwal di kemudian hari.</span>
                     </div>
 
                     <button
                       type="submit"
-                      disabled={!selectedSession}
+                      disabled={!selectedSession || submitting}
                       className={`w-full py-3.5 rounded-xl font-bold text-white shadow-md transition flex items-center justify-center gap-2 ${
-                        selectedSession 
+                        selectedSession && !submitting
                           ? 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-200 cursor-pointer' 
                           : 'bg-slate-300 cursor-not-allowed'
                       }`}
                     >
-                      {selectedSession ? (
+                      {submitting ? 'Menyimpan ke Cloud...' : selectedSession ? (
                         <>Konfirmasi & Kunci Jadwal Sekarang <ArrowRight className="w-4 h-4" /></>
                       ) : (
                         'Silakan Pilih Sesi Jam Terlebih Dahulu'
@@ -487,14 +495,14 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: PORTAL CEK JADWAL ORANG TUA */}
+        {/* TAB 2: PORTAL ORTU */}
         {activeTab === 'parent' && (
           <div className="max-w-2xl mx-auto space-y-6">
             <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 text-center">
               <UserCheck className="w-12 h-12 mx-auto text-indigo-600 mb-2" />
               <h2 className="text-xl font-bold text-slate-800">Cek Jadwal Belajar Anak</h2>
               <p className="text-sm text-slate-500 mt-1 mb-5">
-                Masukkan nomor WhatsApp yang Anda gunakan saat mendaftar untuk melihat semua jadwal aktif.
+                Masukkan nomor WhatsApp pendaftaran untuk melihat jadwal aktif secara online.
               </p>
 
               <form onSubmit={handleParentSearch} className="flex gap-2 max-w-md mx-auto">
@@ -517,10 +525,10 @@ export default function App() {
 
             {parentResults !== null && (
               <div className="space-y-4">
-                <h3 className="font-bold text-slate-700">Hasil Pencarian ({parentResults.length} Jadwal Ditemukan):</h3>
+                <h3 className="font-bold text-slate-700">Hasil Pencarian ({parentResults.length} Jadwal):</h3>
                 {parentResults.length === 0 ? (
                   <div className="bg-white p-8 rounded-2xl border text-center text-slate-500">
-                    Tidak ditemukan riwayat pendaftaran dengan nomor tersebut. Pastikan nomor sesuai saat pendaftaran.
+                    Tidak ditemukan pendaftaran dengan nomor tersebut.
                   </div>
                 ) : (
                   parentResults.map((item) => (
@@ -535,13 +543,13 @@ export default function App() {
                         <div className="text-xs text-slate-500 mt-1 flex flex-wrap gap-x-4 gap-y-1">
                           <span>📅 Tanggal: <strong className="text-slate-700">{item.date}</strong></span>
                           <span>⏰ Jam: <strong className="text-emerald-600">{item.sessionTime}</strong></span>
-                          <span>🔖 No Reg: {item.id}</span>
+                          <span>🔖 Reg: {item.regCode || item.id}</span>
                         </div>
                       </div>
 
                       <a
                         href={`https://wa.me/${ADMIN_PHONE}?text=${encodeURIComponent(
-                          `Halo Admin Bimbel ABE-Q, saya ingin menanyakan jadwal untuk ${item.childName} (No Reg:${item.id}) pada tanggal ${item.date} sesi${item.sessionTime}.`
+                          `Halo Admin Bimbel ABE-Q, saya ingin menanyakan jadwal untuk ${item.childName} pada tanggal ${item.date} sesi${item.sessionTime}.`
                         )}`}
                         target="_blank"
                         rel="noopener noreferrer"
@@ -557,11 +565,10 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: ADMIN DASHBOARD */}
+        {/* TAB 3: ADMIN */}
         {activeTab === 'admin' && (
           <div>
             {!isAdminLoggedIn ? (
-              /* Halaman Login Admin */
               <div className="max-w-md mx-auto bg-white p-6 sm:p-8 rounded-2xl shadow-sm border border-slate-200">
                 <div className="text-center mb-6">
                   <Lock className="w-10 h-10 mx-auto text-indigo-600 mb-2" />
@@ -603,12 +610,11 @@ export default function App() {
                 </form>
               </div>
             ) : (
-              /* Tampilan Dashboard Admin */
               <div className="space-y-5">
                 <div className="flex flex-wrap justify-between items-center gap-3 bg-white p-4 rounded-2xl border shadow-sm">
                   <div>
                     <h2 className="text-lg font-bold text-slate-800">Dashboard Manajemen Bimbel ABE-Q</h2>
-                    <p className="text-xs text-slate-500">Total {bookings.length} Peserta Terdaftar di Sistem</p>
+                    <p className="text-xs text-slate-500">Total {bookings.length} Peserta Terdaftar di Cloud Database</p>
                   </div>
                   <div className="flex items-center gap-2">
                     <button 
@@ -626,7 +632,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Filter & Pencarian */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-white p-4 rounded-xl border">
                   <div>
                     <label className="block text-[11px] font-semibold text-slate-500 mb-1">Cari Nama / No WA</label>
@@ -663,7 +668,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Tabel Data */}
                 <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs">
@@ -680,14 +684,15 @@ export default function App() {
                       <tbody className="divide-y divide-slate-100">
                         {bookings
                           .filter(b => {
-                            const matchSearch = b.childName.toLowerCase().includes(adminSearch.toLowerCase()) || b.parentPhone.includes(adminSearch);
+                            const nameMatch = b.childName ? b.childName.toLowerCase().includes(adminSearch.toLowerCase()) : false;
+                            const phoneMatch = b.parentPhone ? b.parentPhone.includes(adminSearch) : false;
                             const matchDate = adminFilterDate ? b.date === adminFilterDate : true;
                             const matchGrade = adminGradeFilter !== 'ALL' ? b.grade === adminGradeFilter : true;
-                            return matchSearch && matchDate && matchGrade;
+                            return (nameMatch || phoneMatch) && matchDate && matchGrade;
                           })
                           .map((b) => (
                             <tr key={b.id} className="hover:bg-slate-50 transition">
-                              <td className="p-3 font-mono font-medium text-indigo-600">{b.id}</td>
+                              <td className="p-3 font-mono font-medium text-indigo-600">{b.regCode || b.id}</td>
                               <td className="p-3 font-semibold text-slate-800">{b.childName}</td>
                               <td className="p-3">
                                 <span className="bg-slate-100 px-2 py-0.5 rounded font-bold">{b.grade}</span>
@@ -729,12 +734,10 @@ export default function App() {
             )}
           </div>
         )}
-
       </main>
 
-      {/* Footer */}
       <footer className="bg-white border-t py-4 text-center text-xs text-slate-400 mt-6">
-        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Seluruh hak cipta dilindungi.
+        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Real-time Cloud Connected.
       </footer>
     </div>
   );
