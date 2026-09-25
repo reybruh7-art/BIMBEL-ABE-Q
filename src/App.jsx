@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Calendar as CalendarIcon, 
   Clock, 
@@ -40,7 +40,7 @@ export default function App() {
 
   // Form Booking & Keranjang Pilihan Sesi
   const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split('T')[0]);
-  const [cart, setCart] = useState([]); // Array sesi yang dipilih [{ date, sessionId, sessionTime, label }]
+  const [cart, setCart] = useState([]);
   const [childName, setChildName] = useState('');
   const [grade, setGrade] = useState('SD123');
   const [parentPhone, setParentPhone] = useState('');
@@ -60,7 +60,7 @@ export default function App() {
   const [adminSearch, setAdminSearch] = useState('');
   const [adminGradeFilter, setAdminGradeFilter] = useState('ALL');
 
-  // Real-time listener dari Cloud Firestore
+  // Real-time Firestore sync
   useEffect(() => {
     const unsub = onSnapshot(collection(db, 'bookings'), (snapshot) => {
       const docs = snapshot.docs.map(d => ({
@@ -81,7 +81,6 @@ export default function App() {
     return bookings.filter(b => b.date === date && Number(b.sessionId) === Number(sessionId)).length;
   };
 
-  // Toggle tambah / hapus sesi dari pilihan (Multi-Select)
   const toggleSessionSelection = (sess) => {
     const alreadySelected = cart.some(item => item.date === selectedDate && item.sessionId === sess.id);
     if (alreadySelected) {
@@ -105,7 +104,6 @@ export default function App() {
     setCart(cart.filter((_, i) => i !== index));
   };
 
-  // Submit Semua Pilihan Sekaligus
   const handleBookingSubmit = async (e) => {
     e.preventDefault();
     if (cart.length === 0) {
@@ -117,7 +115,6 @@ export default function App() {
       return;
     }
 
-    // Validasi ulang apakah ada yang baru saja penuh di Firestore
     for (const item of cart) {
       const currentCount = getSessionCount(item.date, item.sessionId);
       if (currentCount >= MAX_CAPACITY) {
@@ -198,16 +195,76 @@ export default function App() {
     }
   };
 
+  // PENGELOMPOKAN DATA ADMIN PER ANAK (Group by Child & Phone)
+  const groupedAdminBookings = useMemo(() => {
+    const groups = {};
+
+    bookings.forEach((b) => {
+      // Kelompokkan berdasarkan batchRegCode jika ada, atau kombinasi nama + nomor HP
+      const key = b.batchRegCode || `${b.childName.trim().toLowerCase()}_${b.parentPhone}`;
+
+      if (!groups[key]) {
+        groups[key] = {
+          groupKey: key,
+          batchCode: b.batchRegCode || b.regCode || b.id,
+          childName: b.childName,
+          grade: b.grade,
+          parentPhone: b.parentPhone,
+          latestDate: b.createdAt || '',
+          sessions: []
+        };
+      }
+
+      groups[key].sessions.push({
+        docId: b.id,
+        regCode: b.regCode || b.id,
+        date: b.date,
+        sessionId: b.sessionId,
+        sessionTime: b.sessionTime,
+        createdAt: b.createdAt
+      });
+    });
+
+    // Urutkan sesi di dalam setiap kelompok berdasarkan tanggal dan sesi
+    Object.values(groups).forEach(g => {
+      g.sessions.sort((a, b) => {
+        if (a.date === b.date) return Number(a.sessionId) - Number(b.sessionId);
+        return a.date.localeCompare(b.date);
+      });
+    });
+
+    return Object.values(groups);
+  }, [bookings]);
+
+  // Filter Data yang Telah Dikelompokkan
+  const filteredGroupedBookings = useMemo(() => {
+    return groupedAdminBookings.filter(g => {
+      const nameMatch = g.childName.toLowerCase().includes(adminSearch.toLowerCase());
+      const phoneMatch = g.parentPhone.includes(adminSearch);
+      const regMatch = g.batchCode.toLowerCase().includes(adminSearch.toLowerCase());
+      const matchSearch = nameMatch || phoneMatch || regMatch;
+
+      const matchGrade = adminGradeFilter !== 'ALL' ? g.grade === adminGradeFilter : true;
+      const matchDate = adminFilterDate 
+        ? g.sessions.some(s => s.date === adminFilterDate) 
+        : true;
+
+      return matchSearch && matchGrade && matchDate;
+    });
+  }, [groupedAdminBookings, adminSearch, adminFilterDate, adminGradeFilter]);
+
+  // Ekspor CSV Rapi (1 Baris per Anak)
   const exportToCSV = () => {
-    if (bookings.length === 0) {
+    if (groupedAdminBookings.length === 0) {
       alert('Belum ada data untuk diekspor!');
       return;
     }
 
-    const headers = ['ID Reg,Tanggal,Sesi Jam,Nama Anak,Jenjang,No WA Ortu,Waktu Daftar'];
-    const rows = bookings.map(b => 
-      `"${b.regCode || b.id}","${b.date}","${b.sessionTime}","${b.childName}","${b.grade}","${b.parentPhone}","${new Date(b.createdAt).toLocaleString('id-ID')}"`
-    );
+    const headers = ['ID Pendaftaran/Batch,Nama Anak,Jenjang,No WA Ortu,Total Sesi,Daftar Tanggal & Sesi Jam'];
+    const rows = groupedAdminBookings.map(g => {
+      const sessionListStr = g.sessions.map(s => `${s.date} [${s.sessionTime}]`).join('; ');
+      return `"${g.batchCode}","${g.childName}","${g.grade}","${g.parentPhone}","${g.sessions.length}","${sessionListStr}"`;
+    });
 
     const csvContent = 'data:text/csv;charset=utf-8,\uFEFF' + [headers, ...rows].join('\n');
     const encodedUri = encodeURI(csvContent);
@@ -219,12 +276,28 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  const deleteBooking = async (docId) => {
-    if (confirm('Yakin ingin membatalkan pendaftaran sesi ini? Sisa kuota akan otomatis bertambah.')) {
+  // Hapus Seluruh Sesi Milik Anak
+  const deleteEntireStudentGroup = async (group) => {
+    if (confirm(`Hapus seluruh (${group.sessions.length}) pendaftaran sesi untuk anak "${group.childName}"? Sisa kuota akan langsung dikembalikan.`)) {
+      try {
+        const batch = writeBatch(db);
+        group.sessions.forEach(s => {
+          batch.delete(doc(db, 'bookings', s.docId));
+        });
+        await batch.commit();
+      } catch (err) {
+        alert('Gagal menghapus data.');
+      }
+    }
+  };
+
+  // Hapus 1 Sesi Tertentu
+  const deleteSingleSession = async (docId, info) => {
+    if (confirm(`Batalkan sesi ${info}? Kuota akan bertambah kembali.`)) {
       try {
         await deleteDoc(doc(db, 'bookings', docId));
       } catch (err) {
-        alert('Gagal menghapus data.');
+        alert('Gagal membatalkan sesi.');
       }
     }
   };
@@ -285,7 +358,6 @@ export default function App() {
         {activeTab === 'booking' && (
           <div>
             {confirmedBatch ? (
-              /* Halaman Konfirmasi Batch & WA */
               <div className="max-w-2xl mx-auto bg-white rounded-2xl shadow-xl border border-emerald-100 overflow-hidden">
                 <div className="bg-emerald-500 text-white p-6 text-center">
                   <CheckCircle className="w-16 h-16 mx-auto mb-2 text-white animate-bounce" />
@@ -315,7 +387,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Tombol WA Langsung dengan Ringkasan Semua Sesi */}
                   <div className="text-center">
                     <a
                       href={`https://wa.me/${ADMIN_PHONE}?text=${encodeURIComponent(
@@ -337,7 +408,6 @@ export default function App() {
                     </a>
                   </div>
 
-                  {/* Rekening & QRIS */}
                   <div className="border-t pt-5">
                     <p className="text-xs text-amber-800 bg-amber-50 p-3 rounded-lg mb-4">
                       *Seluruh {confirmedBatch.items.length} sesi Anda sudah terkunci di jadwal. Pembayaran dapat diselesaikan sebelum waktu belajar dimulai.
@@ -383,10 +453,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              /* Tampilan Form Multi-Select */
               <div className="grid lg:grid-cols-3 gap-6">
-                
-                {/* Kolom Kiri: Pilih Tanggal & Keranjang Sesi */}
                 <div className="lg:col-span-1 space-y-4">
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <label className="block text-sm font-bold text-slate-700 mb-2 flex items-center gap-2">
@@ -406,7 +473,6 @@ export default function App() {
                     </p>
                   </div>
 
-                  {/* Keranjang Sesi Terpilih */}
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <div className="flex justify-between items-center mb-3">
                       <h4 className="font-bold text-sm text-slate-800 flex items-center gap-1.5">
@@ -449,7 +515,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Kolom Kanan: Pilihan Sesi Jam & Form Submit */}
                 <div className="lg:col-span-2 space-y-6">
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <div className="flex justify-between items-center mb-1">
@@ -516,7 +581,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Form Identitas & Tombol Submit Semua */}
                   <form onSubmit={handleBookingSubmit} className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200 space-y-4">
                     <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
                       <Users className="w-5 h-5 text-indigo-600" />
@@ -655,7 +719,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: ADMIN DASHBOARD */}
+        {/* TAB 3: ADMIN DASHBOARD (GROUPED BY STUDENT) */}
         {activeTab === 'admin' && (
           <div>
             {!isAdminLoggedIn ? (
@@ -703,8 +767,10 @@ export default function App() {
               <div className="space-y-5">
                 <div className="flex flex-wrap justify-between items-center gap-3 bg-white p-4 rounded-2xl border shadow-sm">
                   <div>
-                    <h2 className="text-lg font-bold text-slate-800">Dashboard Manajemen Bimbel ABE-Q</h2>
-                    <p className="text-xs text-slate-500">Total {bookings.length} Sesi Terdaftar di Cloud Database</p>
+                    <h2 className="text-lg font-bold text-slate-800">Dashboard Manajemen Siswa Bimbel ABE-Q</h2>
+                    <p className="text-xs text-slate-500">
+                      Total <strong>{groupedAdminBookings.length} Siswa Terdaftar</strong> ({bookings.length} Total Sesi Belajar)
+                    </p>
                   </div>
                   <div className="flex items-center gap-2">
                     <button 
@@ -722,9 +788,10 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Filter & Pencarian */}
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-white p-4 rounded-xl border">
                   <div>
-                    <label className="block text-[11px] font-semibold text-slate-500 mb-1">Cari Nama / No WA</label>
+                    <label className="block text-[11px] font-semibold text-slate-500 mb-1">Cari Nama / No WA / Kode</label>
                     <input 
                       type="text"
                       placeholder="Ketik pencarian..."
@@ -758,62 +825,82 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* Tabel Data Siswa Rapi (1 Nama = Banyak Sesi) */}
                 <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs">
                       <thead className="bg-slate-50 border-b text-slate-600 font-bold uppercase tracking-wider">
                         <tr>
-                          <th className="p-3">No. Reg</th>
-                          <th className="p-3">Nama Anak</th>
+                          <th className="p-3">Kode Reg</th>
+                          <th className="p-3">Nama Siswa</th>
                           <th className="p-3">Jenjang</th>
-                          <th className="p-3">Tanggal & Sesi</th>
+                          <th className="p-3">Daftar Sesi Terpilih</th>
                           <th className="p-3">No WA Ortu</th>
                           <th className="p-3 text-center">Aksi</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
-                        {bookings
-                          .filter(b => {
-                            const nameMatch = b.childName ? b.childName.toLowerCase().includes(adminSearch.toLowerCase()) : false;
-                            const phoneMatch = b.parentPhone ? b.parentPhone.includes(adminSearch) : false;
-                            const matchDate = adminFilterDate ? b.date === adminFilterDate : true;
-                            const matchGrade = adminGradeFilter !== 'ALL' ? b.grade === adminGradeFilter : true;
-                            return (nameMatch || phoneMatch) && matchDate && matchGrade;
-                          })
-                          .map((b) => (
-                            <tr key={b.id} className="hover:bg-slate-50 transition">
-                              <td className="p-3 font-mono font-medium text-indigo-600">{b.regCode || b.id}</td>
-                              <td className="p-3 font-semibold text-slate-800">{b.childName}</td>
-                              <td className="p-3">
-                                <span className="bg-slate-100 px-2 py-0.5 rounded font-bold">{b.grade}</span>
-                              </td>
-                              <td className="p-3">
-                                <div className="font-semibold text-slate-700">{b.date}</div>
-                                <div className="text-[11px] text-emerald-600">{b.sessionTime}</div>
-                              </td>
-                              <td className="p-3 font-mono">
-                                <a 
-                                  href={`https://wa.me/${b.parentPhone}`} 
-                                  target="_blank" 
-                                  rel="noopener noreferrer"
-                                  className="text-emerald-700 hover:underline flex items-center gap-1"
-                                >
-                                  {b.parentPhone}
-                                </a>
-                              </td>
-                              <td className="p-3 text-center">
-                                <button 
-                                  onClick={() => deleteBooking(b.id)}
-                                  className="text-rose-500 hover:text-rose-700 hover:underline font-semibold"
-                                >
-                                  Hapus
-                                </button>
-                              </td>
-                            </tr>
-                          ))}
-                        {bookings.length === 0 && (
+                        {filteredGroupedBookings.map((group) => (
+                          <tr key={group.groupKey} className="hover:bg-slate-50 transition align-top">
+                            <td className="p-3 font-mono font-medium text-indigo-600">
+                              {group.batchCode}
+                              <div className="text-[10px] text-slate-400 mt-0.5">{group.sessions.length} sesi</div>
+                            </td>
+                            <td className="p-3">
+                              <span className="font-bold text-slate-800 text-sm block">{group.childName}</span>
+                            </td>
+                            <td className="p-3">
+                              <span className="bg-slate-100 px-2 py-0.5 rounded font-bold text-slate-700">
+                                {group.grade}
+                              </span>
+                            </td>
+                            <td className="p-3">
+                              {/* Seluruh Sesi Disatukan Rapi di Kolom Ini */}
+                              <div className="flex flex-wrap gap-1.5 max-w-lg">
+                                {group.sessions.map((sess) => (
+                                  <div 
+                                    key={sess.docId}
+                                    className="inline-flex items-center gap-1.5 bg-indigo-50 border border-indigo-200 rounded-lg px-2.5 py-1 text-[11px]"
+                                  >
+                                    <span className="font-bold text-slate-700">📅 {sess.date}</span>
+                                    <span className="text-emerald-700 font-semibold font-mono">⏰ {sess.sessionTime}</span>
+                                    <button 
+                                      onClick={() => deleteSingleSession(sess.docId, `${sess.date} (${sess.sessionTime})`)}
+                                      className="ml-1 text-slate-400 hover:text-rose-600"
+                                      title="Batalkan hanya sesi ini"
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            </td>
+                            <td className="p-3 font-mono">
+                              <a 
+                                href={`https://wa.me/${group.parentPhone}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                className="text-emerald-700 hover:underline font-semibold flex items-center gap-1"
+                              >
+                                <Phone className="w-3 h-3" />
+                                {group.parentPhone}
+                              </a>
+                            </td>
+                            <td className="p-3 text-center">
+                              <button 
+                                onClick={() => deleteEntireStudentGroup(group)}
+                                className="px-2.5 py-1 text-rose-600 hover:bg-rose-50 border border-rose-200 rounded-lg text-xs font-semibold transition"
+                              >
+                                Hapus Semua
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                        {filteredGroupedBookings.length === 0 && (
                           <tr>
-                            <td colSpan="6" className="text-center p-6 text-slate-400">Belum ada pendaftaran yang masuk.</td>
+                            <td colSpan="6" className="text-center p-8 text-slate-400">
+                              Belum ada pendaftaran yang sesuai dengan filter.
+                            </td>
                           </tr>
                         )}
                       </tbody>
@@ -827,7 +914,7 @@ export default function App() {
       </main>
 
       <footer className="bg-white border-t py-4 text-center text-xs text-slate-400 mt-6">
-        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Real-time Multi-Booking Enabled.
+        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Real-time Multi-Booking & Grouped View.
       </footer>
     </div>
   );
