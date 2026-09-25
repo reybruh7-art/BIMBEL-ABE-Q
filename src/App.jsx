@@ -11,6 +11,7 @@ import {
   AlertCircle,
   Copy,
   ArrowRight,
+  BookOpen,
   UserCheck,
   Plus,
   Trash2,
@@ -18,9 +19,6 @@ import {
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, onSnapshot, writeBatch, doc, deleteDoc, serverTimestamp } from 'firebase/firestore';
-
-// Gambar Logo Resmi ABE-Q
-const ABEQ_LOGO = "https://lh3.googleusercontent.com/d/1_9i5-c3B5Z4G1Xp-Qk8Jm2H7K0L9MnOp=w400"; // fallback visual SVG tersemat di bawah jika link eksternal tidak aktif
 
 const SESSIONS = [
   { id: 1, time: '08:00 - 09:00', label: 'Sesi 1' },
@@ -59,7 +57,7 @@ export default function App() {
   const [adminPass, setAdminPass] = useState('');
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(false);
   const [adminFilterDate, setAdminFilterDate] = useState('');
-  const [adminFilterSession, setAdminFilterSession] = useState('ALL'); // Filter Sesi Admin
+  const [adminFilterSession, setAdminFilterSession] = useState('ALL');
   const [adminSearch, setAdminSearch] = useState('');
   const [adminGradeFilter, setAdminGradeFilter] = useState('ALL');
 
@@ -261,7 +259,6 @@ export default function App() {
     });
   }, [groupedAdminBookings, adminSearch, adminFilterDate, adminFilterSession, adminGradeFilter]);
 
-  // Hitung jumlah anak pada tanggal & sesi yang dipilih di filter
   const activeFilterCount = useMemo(() => {
     if (!adminFilterDate && adminFilterSession === 'ALL') return null;
     return bookings.filter(b => {
@@ -324,26 +321,14 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
       
-      {/* Header dengan Logo ABE-Q Resmi */}
+      {/* Header dengan Logo Buku Kuning Asli */}
       <header className="bg-indigo-600 text-white shadow-md sticky top-0 z-50">
-        <div className="max-w-6xl mx-auto px-4 py-2.5 flex flex-wrap justify-between items-center gap-3">
-          <div className="flex items-center gap-3">
-            {/* Logo ABE-Q dengan Wadah Background Putih Bulat Rapi */}
-            <div className="w-11 h-11 bg-white rounded-xl shadow-md p-1 flex items-center justify-center overflow-hidden border border-indigo-200 flex-shrink-0">
-              <svg viewBox="0 0 100 100" className="w-full h-full">
-                <path d="M 50 10 C 65 25 75 35 75 50 C 75 75 25 75 25 50 C 25 35 35 25 50 10 Z" fill="#0d9488" opacity="0.15" />
-                <path d="M 50 15 Q 70 35 70 52 Q 50 48 50 68 Q 50 48 30 52 Q 30 35 50 15 Z" fill="none" stroke="#0d9488" strokeWidth="4" />
-                <circle cx="38" cy="40" r="7" fill="#0284c7" />
-                <circle cx="62" cy="40" r="7" fill="#f43f5e" />
-                <path d="M 30 65 Q 50 58 70 65" stroke="#0d9488" strokeWidth="4" fill="none" />
-                <text x="50" y="86" fontSize="16" fontWeight="bold" textAnchor="middle" fill="#0d9488">ABE-Q</text>
-              </svg>
-            </div>
+        <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
+          <div className="flex items-center gap-2">
+            <BookOpen className="w-7 h-7 text-amber-300" />
             <div>
-              <h1 className="text-xl font-extrabold tracking-tight leading-tight">BIMBEL ABE-Q</h1>
-              <p className="text-[11px] text-indigo-100 font-medium tracking-wide">
-                Applied Behavior &amp; Educational - Qurani
-              </p>
+              <h1 className="text-xl font-bold tracking-tight">BIMBEL ABE-Q</h1>
+              <p className="text-xs text-indigo-100">Sistem Pendaftaran Jadwal Belajar</p>
             </div>
           </div>
           
