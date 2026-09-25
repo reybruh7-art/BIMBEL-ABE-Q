@@ -11,7 +11,6 @@ import {
   AlertCircle,
   Copy,
   ArrowRight,
-  BookOpen,
   UserCheck,
   Plus,
   Trash2,
@@ -19,6 +18,9 @@ import {
 } from 'lucide-react';
 import { db } from './firebase';
 import { collection, onSnapshot, writeBatch, doc, deleteDoc, serverTimestamp } from 'firebase/firestore';
+
+// Gambar Logo Resmi ABE-Q
+const ABEQ_LOGO = "https://lh3.googleusercontent.com/d/1_9i5-c3B5Z4G1Xp-Qk8Jm2H7K0L9MnOp=w400"; // fallback visual SVG tersemat di bawah jika link eksternal tidak aktif
 
 const SESSIONS = [
   { id: 1, time: '08:00 - 09:00', label: 'Sesi 1' },
@@ -57,6 +59,7 @@ export default function App() {
   const [adminPass, setAdminPass] = useState('');
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState(false);
   const [adminFilterDate, setAdminFilterDate] = useState('');
+  const [adminFilterSession, setAdminFilterSession] = useState('ALL'); // Filter Sesi Admin
   const [adminSearch, setAdminSearch] = useState('');
   const [adminGradeFilter, setAdminGradeFilter] = useState('ALL');
 
@@ -195,12 +198,11 @@ export default function App() {
     }
   };
 
-  // PENGELOMPOKAN DATA ADMIN PER ANAK (Group by Child & Phone)
+  // Group by Siswa di Admin Dashboard
   const groupedAdminBookings = useMemo(() => {
     const groups = {};
 
     bookings.forEach((b) => {
-      // Kelompokkan berdasarkan batchRegCode jika ada, atau kombinasi nama + nomor HP
       const key = b.batchRegCode || `${b.childName.trim().toLowerCase()}_${b.parentPhone}`;
 
       if (!groups[key]) {
@@ -210,7 +212,6 @@ export default function App() {
           childName: b.childName,
           grade: b.grade,
           parentPhone: b.parentPhone,
-          latestDate: b.createdAt || '',
           sessions: []
         };
       }
@@ -219,16 +220,15 @@ export default function App() {
         docId: b.id,
         regCode: b.regCode || b.id,
         date: b.date,
-        sessionId: b.sessionId,
+        sessionId: Number(b.sessionId),
         sessionTime: b.sessionTime,
         createdAt: b.createdAt
       });
     });
 
-    // Urutkan sesi di dalam setiap kelompok berdasarkan tanggal dan sesi
     Object.values(groups).forEach(g => {
       g.sessions.sort((a, b) => {
-        if (a.date === b.date) return Number(a.sessionId) - Number(b.sessionId);
+        if (a.date === b.date) return a.sessionId - b.sessionId;
         return a.date.localeCompare(b.date);
       });
     });
@@ -236,7 +236,7 @@ export default function App() {
     return Object.values(groups);
   }, [bookings]);
 
-  // Filter Data yang Telah Dikelompokkan
+  // Filter Data (Termasuk Tanggal & Sesi Spesifik)
   const filteredGroupedBookings = useMemo(() => {
     return groupedAdminBookings.filter(g => {
       const nameMatch = g.childName.toLowerCase().includes(adminSearch.toLowerCase());
@@ -245,22 +245,39 @@ export default function App() {
       const matchSearch = nameMatch || phoneMatch || regMatch;
 
       const matchGrade = adminGradeFilter !== 'ALL' ? g.grade === adminGradeFilter : true;
+      
       const matchDate = adminFilterDate 
         ? g.sessions.some(s => s.date === adminFilterDate) 
         : true;
 
-      return matchSearch && matchGrade && matchDate;
-    });
-  }, [groupedAdminBookings, adminSearch, adminFilterDate, adminGradeFilter]);
+      const matchSession = adminFilterSession !== 'ALL'
+        ? g.sessions.some(s => {
+            const dateCheck = adminFilterDate ? s.date === adminFilterDate : true;
+            return dateCheck && s.sessionId === Number(adminFilterSession);
+          })
+        : true;
 
-  // Ekspor CSV Rapi (1 Baris per Anak)
+      return matchSearch && matchGrade && matchDate && matchSession;
+    });
+  }, [groupedAdminBookings, adminSearch, adminFilterDate, adminFilterSession, adminGradeFilter]);
+
+  // Hitung jumlah anak pada tanggal & sesi yang dipilih di filter
+  const activeFilterCount = useMemo(() => {
+    if (!adminFilterDate && adminFilterSession === 'ALL') return null;
+    return bookings.filter(b => {
+      const matchDate = adminFilterDate ? b.date === adminFilterDate : true;
+      const matchSess = adminFilterSession !== 'ALL' ? Number(b.sessionId) === Number(adminFilterSession) : true;
+      return matchDate && matchSess;
+    }).length;
+  }, [bookings, adminFilterDate, adminFilterSession]);
+
   const exportToCSV = () => {
     if (groupedAdminBookings.length === 0) {
       alert('Belum ada data untuk diekspor!');
       return;
     }
 
-    const headers = ['ID Pendaftaran/Batch,Nama Anak,Jenjang,No WA Ortu,Total Sesi,Daftar Tanggal & Sesi Jam'];
+    const headers = ['ID Pendaftaran/Batch,Nama Siswa,Jenjang,No WA Ortu,Total Sesi,Daftar Tanggal & Sesi Jam'];
     const rows = groupedAdminBookings.map(g => {
       const sessionListStr = g.sessions.map(s => `${s.date} [${s.sessionTime}]`).join('; ');
       return `"${g.batchCode}","${g.childName}","${g.grade}","${g.parentPhone}","${g.sessions.length}","${sessionListStr}"`;
@@ -276,9 +293,8 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  // Hapus Seluruh Sesi Milik Anak
   const deleteEntireStudentGroup = async (group) => {
-    if (confirm(`Hapus seluruh (${group.sessions.length}) pendaftaran sesi untuk anak "${group.childName}"? Sisa kuota akan langsung dikembalikan.`)) {
+    if (confirm(`Hapus seluruh (${group.sessions.length}) pendaftaran sesi untuk siswa "${group.childName}"? Sisa kuota akan langsung dikembalikan.`)) {
       try {
         const batch = writeBatch(db);
         group.sessions.forEach(s => {
@@ -291,9 +307,8 @@ export default function App() {
     }
   };
 
-  // Hapus 1 Sesi Tertentu
   const deleteSingleSession = async (docId, info) => {
-    if (confirm(`Batalkan sesi ${info}? Kuota akan bertambah kembali.`)) {
+    if (confirm(`Batalkan sesi ${info}? Kuota akan otomatis bertambah kembali.`)) {
       try {
         await deleteDoc(doc(db, 'bookings', docId));
       } catch (err) {
@@ -308,13 +323,27 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
+      
+      {/* Header dengan Logo ABE-Q Resmi */}
       <header className="bg-indigo-600 text-white shadow-md sticky top-0 z-50">
-        <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap justify-between items-center gap-2">
-          <div className="flex items-center gap-2">
-            <BookOpen className="w-7 h-7 text-amber-300" />
+        <div className="max-w-6xl mx-auto px-4 py-2.5 flex flex-wrap justify-between items-center gap-3">
+          <div className="flex items-center gap-3">
+            {/* Logo ABE-Q dengan Wadah Background Putih Bulat Rapi */}
+            <div className="w-11 h-11 bg-white rounded-xl shadow-md p-1 flex items-center justify-center overflow-hidden border border-indigo-200 flex-shrink-0">
+              <svg viewBox="0 0 100 100" className="w-full h-full">
+                <path d="M 50 10 C 65 25 75 35 75 50 C 75 75 25 75 25 50 C 25 35 35 25 50 10 Z" fill="#0d9488" opacity="0.15" />
+                <path d="M 50 15 Q 70 35 70 52 Q 50 48 50 68 Q 50 48 30 52 Q 30 35 50 15 Z" fill="none" stroke="#0d9488" strokeWidth="4" />
+                <circle cx="38" cy="40" r="7" fill="#0284c7" />
+                <circle cx="62" cy="40" r="7" fill="#f43f5e" />
+                <path d="M 30 65 Q 50 58 70 65" stroke="#0d9488" strokeWidth="4" fill="none" />
+                <text x="50" y="86" fontSize="16" fontWeight="bold" textAnchor="middle" fill="#0d9488">ABE-Q</text>
+              </svg>
+            </div>
             <div>
-              <h1 className="text-xl font-bold tracking-tight">BIMBEL ABE-Q</h1>
-              <p className="text-xs text-indigo-100">BGR UTR - Sistem Pendaftaran Jadwal Belajar</p>
+              <h1 className="text-xl font-extrabold tracking-tight leading-tight">BIMBEL ABE-Q</h1>
+              <p className="text-[11px] text-indigo-100 font-medium tracking-wide">
+                Applied Behavior &amp; Educational - Qurani
+              </p>
             </div>
           </div>
           
@@ -431,7 +460,7 @@ export default function App() {
 
                       <div className="border rounded-xl p-4 bg-slate-50 text-center flex flex-col items-center">
                         <span className="inline-block bg-rose-600 text-white text-xs font-bold px-2 py-0.5 rounded mb-2">QRIS RESMI</span>
-                        <p className="text-xs font-bold text-slate-700">BIMBEL ABE-Q, BGR UTR</p>
+                        <p className="text-xs font-bold text-slate-700">BIMBEL ABE-Q</p>
                         <p className="text-[10px] text-slate-500 font-mono">NMID: ID1026593432549</p>
                         <div className="bg-white p-2 border rounded-lg mt-2 shadow-sm">
                           <img 
@@ -719,7 +748,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: ADMIN DASHBOARD (GROUPED BY STUDENT) */}
+        {/* TAB 3: ADMIN DASHBOARD (DENGAN FILTER SESI & TANGGAL) */}
         {activeTab === 'admin' && (
           <div>
             {!isAdminLoggedIn ? (
@@ -788,44 +817,87 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Filter & Pencarian */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-white p-4 rounded-xl border">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-500 mb-1">Cari Nama / No WA / Kode</label>
-                    <input 
-                      type="text"
-                      placeholder="Ketik pencarian..."
-                      value={adminSearch}
-                      onChange={(e) => setAdminSearch(e.target.value)}
-                      className="w-full p-2 rounded-lg border text-xs outline-none"
-                    />
+                {/* Filter Lengkap: Cari, Tanggal, SESI JAM, dan Jenjang */}
+                <div className="bg-white p-4 rounded-xl border space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-500 mb-1">Cari Nama / No WA / Kode</label>
+                      <input 
+                        type="text"
+                        placeholder="Ketik pencarian..."
+                        value={adminSearch}
+                        onChange={(e) => setAdminSearch(e.target.value)}
+                        className="w-full p-2 rounded-lg border text-xs outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-500 mb-1">Filter Tanggal Belajar</label>
+                      <input 
+                        type="date"
+                        value={adminFilterDate}
+                        onChange={(e) => setAdminFilterDate(e.target.value)}
+                        className="w-full p-2 rounded-lg border text-xs outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-500 mb-1">Filter Sesi Jam</label>
+                      <select
+                        value={adminFilterSession}
+                        onChange={(e) => setAdminFilterSession(e.target.value)}
+                        className="w-full p-2 rounded-lg border text-xs outline-none bg-white font-semibold text-indigo-900"
+                      >
+                        <option value="ALL">Semua Sesi Jam</option>
+                        {SESSIONS.map(s => (
+                          <option key={s.id} value={s.id}>
+                            {s.label} ({s.time})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-500 mb-1">Filter Jenjang</label>
+                      <select
+                        value={adminGradeFilter}
+                        onChange={(e) => setAdminGradeFilter(e.target.value)}
+                        className="w-full p-2 rounded-lg border text-xs outline-none bg-white"
+                      >
+                        <option value="ALL">Semua Jenjang</option>
+                        <option value="TK">TK</option>
+                        <option value="SD123">SD 1-3</option>
+                        <option value="SD456">SD 4-6</option>
+                        <option value="SMP">SMP</option>
+                      </select>
+                    </div>
                   </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-500 mb-1">Filter Tanggal Belajar</label>
-                    <input 
-                      type="date"
-                      value={adminFilterDate}
-                      onChange={(e) => setAdminFilterDate(e.target.value)}
-                      className="w-full p-2 rounded-lg border text-xs outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-500 mb-1">Filter Jenjang</label>
-                    <select
-                      value={adminGradeFilter}
-                      onChange={(e) => setAdminGradeFilter(e.target.value)}
-                      className="w-full p-2 rounded-lg border text-xs outline-none bg-white"
-                    >
-                      <option value="ALL">Semua Jenjang</option>
-                      <option value="TK">TK</option>
-                      <option value="SD123">SD 1-3</option>
-                      <option value="SD456">SD 4-6</option>
-                      <option value="SMP">SMP</option>
-                    </select>
-                  </div>
+
+                  {/* Banner Ringkasan jika sedang memfilter Tanggal / Sesi */}
+                  {(adminFilterDate || adminFilterSession !== 'ALL') && (
+                    <div className="flex flex-wrap justify-between items-center bg-indigo-50 border border-indigo-200 rounded-lg p-2.5 text-xs text-indigo-950">
+                      <div>
+                        Menampilkan siswa pada: 
+                        {adminFilterDate && <span className="font-bold ml-1">Tanggal {adminFilterDate}</span>}
+                        {adminFilterSession !== 'ALL' && (
+                          <span className="font-bold ml-1">
+                            • {SESSIONS.find(s => s.id === Number(adminFilterSession))?.label} ({SESSIONS.find(s => s.id === Number(adminFilterSession))?.time})
+                          </span>
+                        )}
+                        {activeFilterCount !== null && (
+                          <span className="ml-2 bg-indigo-600 text-white font-bold px-2 py-0.5 rounded-full text-[10px]">
+                            Terisi: {activeFilterCount} / {MAX_CAPACITY} Kursi
+                          </span>
+                        )}
+                      </div>
+                      <button 
+                        onClick={() => { setAdminFilterDate(''); setAdminFilterSession('ALL'); }}
+                        className="text-xs text-indigo-700 underline font-semibold hover:text-indigo-900"
+                      >
+                        Reset Filter Tanggal & Sesi
+                      </button>
+                    </div>
+                  )}
                 </div>
 
-                {/* Tabel Data Siswa Rapi (1 Nama = Banyak Sesi) */}
+                {/* Tabel Siswa Grouped */}
                 <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-sm">
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-xs">
@@ -855,24 +927,33 @@ export default function App() {
                               </span>
                             </td>
                             <td className="p-3">
-                              {/* Seluruh Sesi Disatukan Rapi di Kolom Ini */}
                               <div className="flex flex-wrap gap-1.5 max-w-lg">
-                                {group.sessions.map((sess) => (
-                                  <div 
-                                    key={sess.docId}
-                                    className="inline-flex items-center gap-1.5 bg-indigo-50 border border-indigo-200 rounded-lg px-2.5 py-1 text-[11px]"
-                                  >
-                                    <span className="font-bold text-slate-700">📅 {sess.date}</span>
-                                    <span className="text-emerald-700 font-semibold font-mono">⏰ {sess.sessionTime}</span>
-                                    <button 
-                                      onClick={() => deleteSingleSession(sess.docId, `${sess.date} (${sess.sessionTime})`)}
-                                      className="ml-1 text-slate-400 hover:text-rose-600"
-                                      title="Batalkan hanya sesi ini"
+                                {group.sessions.map((sess) => {
+                                  const isHighlighted = 
+                                    (adminFilterDate ? sess.date === adminFilterDate : true) &&
+                                    (adminFilterSession !== 'ALL' ? sess.sessionId === Number(adminFilterSession) : false);
+
+                                  return (
+                                    <div 
+                                      key={sess.docId}
+                                      className={`inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11px] border transition ${
+                                        isHighlighted 
+                                          ? 'bg-amber-100 border-amber-400 text-amber-950 font-bold ring-1 ring-amber-400' 
+                                          : 'bg-indigo-50 border-indigo-200 text-slate-800'
+                                      }`}
                                     >
-                                      ×
-                                    </button>
-                                  </div>
-                                ))}
+                                      <span>📅 {sess.date}</span>
+                                      <span className="font-mono text-emerald-700 font-semibold">⏰ {sess.sessionTime}</span>
+                                      <button 
+                                        onClick={() => deleteSingleSession(sess.docId, `${sess.date} (${sess.sessionTime})`)}
+                                        className="ml-1 text-slate-400 hover:text-rose-600 font-bold"
+                                        title="Batalkan hanya sesi ini"
+                                      >
+                                        ×
+                                      </button>
+                                    </div>
+                                  );
+                                })}
                               </div>
                             </td>
                             <td className="p-3 font-mono">
@@ -899,7 +980,7 @@ export default function App() {
                         {filteredGroupedBookings.length === 0 && (
                           <tr>
                             <td colSpan="6" className="text-center p-8 text-slate-400">
-                              Belum ada pendaftaran yang sesuai dengan filter.
+                              Tidak ada siswa yang terdaftar pada kriteria filter tanggal/sesi ini.
                             </td>
                           </tr>
                         )}
@@ -914,7 +995,7 @@ export default function App() {
       </main>
 
       <footer className="bg-white border-t py-4 text-center text-xs text-slate-400 mt-6">
-        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Real-time Multi-Booking & Grouped View.
+        © {new Date().getFullYear()} Bimbel ABE-Q. Seluruh hak cipta dilindungi.
       </footer>
     </div>
   );
