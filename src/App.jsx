@@ -12,10 +12,13 @@ import {
   Copy,
   ArrowRight,
   BookOpen,
-  UserCheck
+  UserCheck,
+  Plus,
+  Trash2,
+  CalendarCheck
 } from 'lucide-react';
 import { db } from './firebase';
-import { collection, onSnapshot, addDoc, deleteDoc, doc, serverTimestamp } from 'firebase/firestore';
+import { collection, onSnapshot, writeBatch, doc, deleteDoc, serverTimestamp } from 'firebase/firestore';
 
 const SESSIONS = [
   { id: 1, time: '08:00 - 09:00', label: 'Sesi 1' },
@@ -35,13 +38,13 @@ export default function App() {
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
 
-  // Form Booking
+  // Form Booking & Keranjang Pilihan Sesi
   const [selectedDate, setSelectedDate] = useState(() => new Date().toISOString().split('T')[0]);
-  const [selectedSession, setSelectedSession] = useState(null);
+  const [cart, setCart] = useState([]); // Array sesi yang dipilih [{ date, sessionId, sessionTime, label }]
   const [childName, setChildName] = useState('');
   const [grade, setGrade] = useState('SD123');
   const [parentPhone, setParentPhone] = useState('');
-  const [lastBooking, setLastBooking] = useState(null);
+  const [confirmedBatch, setConfirmedBatch] = useState(null);
   const [copiedRek, setCopiedRek] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
@@ -57,7 +60,7 @@ export default function App() {
   const [adminSearch, setAdminSearch] = useState('');
   const [adminGradeFilter, setAdminGradeFilter] = useState('ALL');
 
-  // Real-time listener: Kuota langsung tersinkron di semua HP tanpa reload
+  // Real-time listener dari Cloud Firestore
   useEffect(() => {
     const unsub = onSnapshot(collection(db, 'bookings'), (snapshot) => {
       const docs = snapshot.docs.map(d => ({
@@ -78,17 +81,49 @@ export default function App() {
     return bookings.filter(b => b.date === date && Number(b.sessionId) === Number(sessionId)).length;
   };
 
+  // Toggle tambah / hapus sesi dari pilihan (Multi-Select)
+  const toggleSessionSelection = (sess) => {
+    const alreadySelected = cart.some(item => item.date === selectedDate && item.sessionId === sess.id);
+    if (alreadySelected) {
+      setCart(cart.filter(item => !(item.date === selectedDate && item.sessionId === sess.id)));
+    } else {
+      const count = getSessionCount(selectedDate, sess.id);
+      if (count >= MAX_CAPACITY) {
+        alert('Maaf, kuota untuk sesi ini sudah penuh!');
+        return;
+      }
+      setCart([...cart, {
+        date: selectedDate,
+        sessionId: sess.id,
+        sessionTime: sess.time,
+        label: sess.label
+      }]);
+    }
+  };
+
+  const removeCartItem = (index) => {
+    setCart(cart.filter((_, i) => i !== index));
+  };
+
+  // Submit Semua Pilihan Sekaligus
   const handleBookingSubmit = async (e) => {
     e.preventDefault();
-    if (!selectedSession || !childName.trim() || !parentPhone.trim()) {
-      alert('Mohon lengkapi semua kolom formulir!');
+    if (cart.length === 0) {
+      alert('Pilih minimal satu sesi terlebih dahulu!');
+      return;
+    }
+    if (!childName.trim() || !parentPhone.trim()) {
+      alert('Mohon isi nama anak dan nomor WhatsApp!');
       return;
     }
 
-    const currentCount = getSessionCount(selectedDate, selectedSession.id);
-    if (currentCount >= MAX_CAPACITY) {
-      alert('Maaf, kuota untuk sesi ini baru saja terisi penuh!');
-      return;
+    // Validasi ulang apakah ada yang baru saja penuh di Firestore
+    for (const item of cart) {
+      const currentCount = getSessionCount(item.date, item.sessionId);
+      if (currentCount >= MAX_CAPACITY) {
+        alert(`Maaf, kuota pada ${item.date} (${item.sessionTime}) baru saja penuh oleh pendaftar lain!`);
+        return;
+      }
     }
 
     let cleanPhone = parentPhone.replace(/\D/g, '');
@@ -97,26 +132,44 @@ export default function App() {
 
     setSubmitting(true);
     try {
-      const regId = 'REG-' + Date.now().toString().slice(-6);
-      const bookingData = {
-        regCode: regId,
-        date: selectedDate,
-        sessionId: selectedSession.id,
-        sessionTime: selectedSession.time,
+      const batch = writeBatch(db);
+      const batchRegCode = 'REG-' + Date.now().toString().slice(-6);
+      const savedItems = [];
+
+      cart.forEach((item, idx) => {
+        const itemRegId = `${batchRegCode}-${idx + 1}`;
+        const newDocRef = doc(collection(db, 'bookings'));
+        const bookingData = {
+          batchRegCode,
+          regCode: itemRegId,
+          date: item.date,
+          sessionId: item.sessionId,
+          sessionTime: item.sessionTime,
+          childName: childName.trim(),
+          grade,
+          parentPhone: cleanPhone,
+          createdAt: new Date().toISOString(),
+          serverTimestamp: serverTimestamp()
+        };
+        batch.set(newDocRef, bookingData);
+        savedItems.push({ ...bookingData, id: newDocRef.id });
+      });
+
+      await batch.commit();
+
+      setConfirmedBatch({
+        batchCode: batchRegCode,
         childName: childName.trim(),
         grade,
         parentPhone: cleanPhone,
-        createdAt: new Date().toISOString(),
-        serverTimestamp: serverTimestamp()
-      };
+        items: savedItems
+      });
 
-      const docRef = await addDoc(collection(db, 'bookings'), bookingData);
-      setLastBooking({ ...bookingData, id: docRef.id });
+      setCart([]);
       setChildName('');
-      setSelectedSession(null);
     } catch (err) {
-      alert('Terjadi kendala saat menyimpan. Pastikan internet aktif.');
       console.error(err);
+      alert('Terjadi kendala saat menyimpan. Pastikan internet aktif.');
     } finally {
       setSubmitting(false);
     }
@@ -132,7 +185,6 @@ export default function App() {
     e.preventDefault();
     let query = searchParentPhone.replace(/\D/g, '');
     if (query.startsWith('0')) query = '62' + query.slice(1);
-    
     const results = bookings.filter(b => b.parentPhone && b.parentPhone.includes(query));
     setParentResults(results);
   };
@@ -168,7 +220,7 @@ export default function App() {
   };
 
   const deleteBooking = async (docId) => {
-    if (confirm('Yakin ingin membatalkan pendaftaran ini? Sisa kuota akan langsung bertambah.')) {
+    if (confirm('Yakin ingin membatalkan pendaftaran sesi ini? Sisa kuota akan otomatis bertambah.')) {
       try {
         await deleteDoc(doc(db, 'bookings', docId));
       } catch (err) {
@@ -195,12 +247,12 @@ export default function App() {
           
           <div className="flex items-center gap-2">
             <button 
-              onClick={() => { setActiveTab('booking'); setLastBooking(null); }}
+              onClick={() => { setActiveTab('booking'); setConfirmedBatch(null); }}
               className={`px-3 py-1.5 rounded-lg text-sm font-medium transition ${
                 activeTab === 'booking' ? 'bg-white text-indigo-700 shadow-sm' : 'hover:bg-indigo-500 text-white'
               }`}
             >
-              Daftar Sesi
+              Daftar Sesi {cart.length > 0 && <span className="ml-1 bg-amber-400 text-indigo-950 px-1.5 py-0.2 rounded-full text-xs font-bold">{cart.length}</span>}
             </button>
             <button 
               onClick={() => setActiveTab('parent')}
@@ -225,74 +277,72 @@ export default function App() {
       <main className="flex-1 max-w-6xl w-full mx-auto p-4 sm:p-6">
         {loading && (
           <div className="p-3 mb-4 bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs rounded-xl text-center">
-            Menghubungkan ke database real-time...
+            Menghubungkan ke database cloud real-time...
           </div>
         )}
 
-        {/* TAB 1: FORM BOOKING */}
+        {/* TAB 1: FORM MULTI-BOOKING */}
         {activeTab === 'booking' && (
           <div>
-            {lastBooking ? (
+            {confirmedBatch ? (
+              /* Halaman Konfirmasi Batch & WA */
               <div className="max-w-2xl mx-auto bg-white rounded-2xl shadow-xl border border-emerald-100 overflow-hidden">
                 <div className="bg-emerald-500 text-white p-6 text-center">
                   <CheckCircle className="w-16 h-16 mx-auto mb-2 text-white animate-bounce" />
-                  <h2 className="text-2xl font-bold">Jadwal Otomatis Terkonfirmasi!</h2>
-                  <p className="text-sm opacity-90">Slot sesi untuk anak Anda sudah resmi tersimpan di sistem.</p>
+                  <h2 className="text-2xl font-bold">Semua Jadwal Terkonfirmasi!</h2>
+                  <p className="text-sm opacity-90">Total {confirmedBatch.items.length} sesi belajar telah terkunci di sistem.</p>
                 </div>
 
                 <div className="p-6 space-y-6">
                   <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
-                    <h3 className="font-semibold text-slate-700 mb-3 border-b pb-2">Rincian Pendaftaran:</h3>
-                    <div className="grid grid-cols-2 gap-3 text-sm">
-                      <div>
-                        <span className="text-slate-500 block">ID Registrasi</span>
-                        <span className="font-bold text-indigo-600">{lastBooking.regCode || lastBooking.id}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Nama Anak</span>
-                        <span className="font-bold">{lastBooking.childName} ({lastBooking.grade})</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Tanggal Sesi</span>
-                        <span className="font-bold">{lastBooking.date}</span>
-                      </div>
-                      <div>
-                        <span className="text-slate-500 block">Waktu Sesi</span>
-                        <span className="font-bold text-emerald-600">{lastBooking.sessionTime}</span>
-                      </div>
+                    <h3 className="font-semibold text-slate-700 mb-2 border-b pb-2">Rincian Siswa:</h3>
+                    <div className="grid grid-cols-2 gap-2 text-sm mb-3">
+                      <div><span className="text-slate-500 block">Kode Booking:</span><strong>{confirmedBatch.batchCode}</strong></div>
+                      <div><span className="text-slate-500 block">Nama Anak:</span><strong>{confirmedBatch.childName} ({confirmedBatch.grade})</strong></div>
+                    </div>
+
+                    <h4 className="font-bold text-xs text-slate-600 mb-2 uppercase tracking-wide">Daftar Jadwal yang Berhasil Diambil:</h4>
+                    <div className="space-y-2">
+                      {confirmedBatch.items.map((item, idx) => (
+                        <div key={idx} className="bg-white p-2.5 rounded-lg border flex justify-between items-center text-xs">
+                          <div>
+                            <span className="font-bold text-slate-800">📅 {item.date}</span>
+                            <span className="text-emerald-700 font-semibold ml-2">⏰ {item.sessionTime}</span>
+                          </div>
+                          <span className="text-indigo-600 font-mono text-[11px]">{item.regCode}</span>
+                        </div>
+                      ))}
                     </div>
                   </div>
 
+                  {/* Tombol WA Langsung dengan Ringkasan Semua Sesi */}
                   <div className="text-center">
                     <a
                       href={`https://wa.me/${ADMIN_PHONE}?text=${encodeURIComponent(
-                        `Halo Admin Bimbel ABE-Q, saya ingin konfirmasi pendaftaran sesi belajar.\n\n` +
-                        `*No Registrasi:* ${lastBooking.regCode || lastBooking.id}\n` +
-                        `*Nama Anak:* ${lastBooking.childName}\n` +
-                        `*Jenjang:* ${lastBooking.grade}\n` +
-                        `*Tanggal:* ${lastBooking.date}\n` +
-                        `*Sesi:* ${lastBooking.sessionTime}\n` +
-                        `*No WA Ortu:* ${lastBooking.parentPhone}\n\n` +
-                        `Terima kasih.`
+                        `Halo Admin Bimbel ABE-Q, saya mengonfirmasi pendaftaran ${confirmedBatch.items.length} sesi belajar.\n\n` +
+                        `*Kode Registrasi:* ${confirmedBatch.batchCode}\n` +
+                        `*Nama Anak:* ${confirmedBatch.childName}\n` +
+                        `*Jenjang:* ${confirmedBatch.grade}\n` +
+                        `*No WA Ortu:* ${confirmedBatch.parentPhone}\n\n` +
+                        `*Daftar Sesi:*\n` +
+                        confirmedBatch.items.map((it, i) => `${i + 1}. Tanggal: ${it.date} (${it.sessionTime})`).join('\n') +
+                        `\n\nTerima kasih.`
                       )}`}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex items-center justify-center gap-2 w-full py-3.5 px-6 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold shadow-lg shadow-emerald-200 transition"
                     >
                       <Phone className="w-5 h-5" />
-                      Konfirmasi Jadwal via WhatsApp Admin
+                      Kirim Konfirmasi Semua Jadwal via WA Admin
                     </a>
                   </div>
 
+                  {/* Rekening & QRIS */}
                   <div className="border-t pt-5">
-                    <div className="bg-amber-50 border-l-4 border-amber-400 p-3 mb-4 rounded-r">
-                      <p className="text-xs text-amber-800 font-medium">
-                        *Catatan: Jadwal Anda sudah terkunci. Opsi pembayaran di bawah dapat diselesaikan sebelum sesi belajar dimulai.
-                      </p>
-                    </div>
+                    <p className="text-xs text-amber-800 bg-amber-50 p-3 rounded-lg mb-4">
+                      *Seluruh {confirmedBatch.items.length} sesi Anda sudah terkunci di jadwal. Pembayaran dapat diselesaikan sebelum waktu belajar dimulai.
+                    </p>
 
-                    <h4 className="font-bold text-slate-800 mb-3">Pilihan Rekening & QRIS Pembayaran:</h4>
-                    
                     <div className="grid sm:grid-cols-2 gap-4">
                       <div className="border rounded-xl p-4 bg-slate-50 flex flex-col justify-between">
                         <div>
@@ -324,81 +374,118 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="pt-2">
-                    <button
-                      onClick={() => setLastBooking(null)}
-                      className="w-full py-2.5 rounded-xl border border-slate-300 hover:bg-slate-100 text-sm font-semibold text-slate-600 transition"
-                    >
-                      Daftarkan Sesi Lain / Anak Lain
-                    </button>
-                  </div>
+                  <button
+                    onClick={() => setConfirmedBatch(null)}
+                    className="w-full py-2.5 rounded-xl border border-slate-300 hover:bg-slate-100 text-sm font-semibold text-slate-600 transition"
+                  >
+                    Tambah Pendaftaran Baru
+                  </button>
                 </div>
               </div>
             ) : (
+              /* Tampilan Form Multi-Select */
               <div className="grid lg:grid-cols-3 gap-6">
+                
+                {/* Kolom Kiri: Pilih Tanggal & Keranjang Sesi */}
                 <div className="lg:col-span-1 space-y-4">
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
                     <label className="block text-sm font-bold text-slate-700 mb-2 flex items-center gap-2">
                       <CalendarIcon className="w-4 h-4 text-indigo-600" />
-                      Pilih Tanggal Belajar:
+                      1. Pilih Tanggal:
                     </label>
                     <input 
                       type="date"
                       min={minDate}
                       max={maxDate}
                       value={selectedDate}
-                      onChange={(e) => {
-                        setSelectedDate(e.target.value);
-                        setSelectedSession(null);
-                      }}
+                      onChange={(e) => setSelectedDate(e.target.value)}
                       className="w-full p-3 rounded-xl border border-slate-300 focus:ring-2 focus:ring-indigo-500 font-semibold text-slate-700 outline-none"
                     />
                     <p className="text-xs text-slate-500 mt-2">
-                      Jadwal tersedia hingga 31 Desember {currentYear}.
+                      💡 Anda bisa memilih beberapa sesi di tanggal ini, lalu ganti tanggal lain untuk memilih lagi!
                     </p>
                   </div>
 
-                  <div className="bg-indigo-50 border border-indigo-100 p-4 rounded-2xl text-xs text-indigo-900 space-y-2">
-                    <h4 className="font-bold flex items-center gap-1.5">
-                      <AlertCircle className="w-4 h-4 text-indigo-600" /> Sinkronisasi Real-Time:
-                    </h4>
-                    <p>• Maksimal <strong>10 anak per sesi</strong>.</p>
-                    <p>• Kuota terhubung langsung secara online, tombol otomatis abu-abu & terkunci jika sudah 10 anak.</p>
+                  {/* Keranjang Sesi Terpilih */}
+                  <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <div className="flex justify-between items-center mb-3">
+                      <h4 className="font-bold text-sm text-slate-800 flex items-center gap-1.5">
+                        <CalendarCheck className="w-4 h-4 text-indigo-600" />
+                        Sesi Terpilih ({cart.length})
+                      </h4>
+                      {cart.length > 0 && (
+                        <button 
+                          onClick={() => setCart([])}
+                          className="text-xs text-rose-500 hover:underline"
+                        >
+                          Hapus Semua
+                        </button>
+                      )}
+                    </div>
+
+                    {cart.length === 0 ? (
+                      <p className="text-xs text-slate-400 text-center py-4 bg-slate-50 rounded-xl border border-dashed">
+                        Belum ada sesi yang dipilih.<br />Pilih sesi di sebelah kanan.
+                      </p>
+                    ) : (
+                      <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                        {cart.map((item, idx) => (
+                          <div key={idx} className="p-2.5 bg-indigo-50/60 border border-indigo-100 rounded-xl flex justify-between items-center text-xs">
+                            <div>
+                              <div className="font-bold text-indigo-950">{item.date}</div>
+                              <div className="text-slate-600">{item.label} ({item.sessionTime})</div>
+                            </div>
+                            <button 
+                              onClick={() => removeCartItem(idx)}
+                              className="text-rose-500 hover:text-rose-700 p-1"
+                              title="Hapus pilihan"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
 
+                {/* Kolom Kanan: Pilihan Sesi Jam & Form Submit */}
                 <div className="lg:col-span-2 space-y-6">
                   <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
-                    <h3 className="text-base font-bold text-slate-800 mb-1 flex items-center gap-2">
-                      <Clock className="w-5 h-5 text-indigo-600" />
-                      Pilih Sesi Jam (Tanggal: {selectedDate})
-                    </h3>
-                    <p className="text-xs text-slate-500 mb-4">Pilih salah satu sesi yang masih tersedia:</p>
+                    <div className="flex justify-between items-center mb-1">
+                      <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
+                        <Clock className="w-5 h-5 text-indigo-600" />
+                        2. Pilih Sesi Jam (Tanggal: {selectedDate})
+                      </h3>
+                    </div>
+                    <p className="text-xs text-slate-500 mb-4">
+                      Klik sesi yang diinginkan untuk menambah/membatalkan. Bisa memilih lebih dari 1 sesi:
+                    </p>
 
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       {SESSIONS.map((sess) => {
                         const filled = getSessionCount(selectedDate, sess.id);
                         const isFull = filled >= MAX_CAPACITY;
-                        const isSelected = selectedSession?.id === sess.id;
+                        const isSelected = cart.some(item => item.date === selectedDate && item.sessionId === sess.id);
 
                         return (
                           <button
                             key={sess.id}
                             type="button"
                             disabled={isFull}
-                            onClick={() => setSelectedSession(sess)}
+                            onClick={() => toggleSessionSelection(sess)}
                             className={`p-3.5 rounded-xl border text-left transition flex justify-between items-center relative ${
                               isFull 
                                 ? 'bg-slate-100 border-slate-200 text-slate-400 cursor-not-allowed'
                                 : isSelected 
-                                  ? 'bg-indigo-50 border-indigo-600 ring-2 ring-indigo-500 text-indigo-950 font-medium'
+                                  ? 'bg-indigo-600 border-indigo-600 text-white shadow-md'
                                   : 'bg-white border-slate-200 hover:border-indigo-400 text-slate-800 hover:bg-slate-50'
                             }`}
                           >
                             <div>
                               <div className="flex items-center gap-2">
                                 <span className={`text-xs px-2 py-0.5 rounded font-bold ${
-                                  isFull ? 'bg-slate-200 text-slate-500' : isSelected ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-700'
+                                  isFull ? 'bg-slate-200 text-slate-500' : isSelected ? 'bg-white text-indigo-700' : 'bg-slate-100 text-slate-700'
                                 }`}>
                                   {sess.label}
                                 </span>
@@ -408,7 +495,9 @@ export default function App() {
                                 {isFull ? (
                                   <span className="text-rose-500 font-bold">PENUH (10/10)</span>
                                 ) : (
-                                  <span className="text-slate-500">Sisa Kursi: <strong className="text-indigo-600">{MAX_CAPACITY - filled} anak</strong></span>
+                                  <span className={isSelected ? 'text-indigo-100' : 'text-slate-500'}>
+                                    Sisa Kursi: <strong className={isSelected ? 'text-white' : 'text-indigo-600'}>{MAX_CAPACITY - filled} anak</strong>
+                                  </span>
                                 )}
                               </div>
                             </div>
@@ -416,9 +505,9 @@ export default function App() {
                               {isFull ? (
                                 <Lock className="w-5 h-5 text-slate-400" />
                               ) : isSelected ? (
-                                <CheckCircle className="w-6 h-6 text-indigo-600" />
+                                <CheckCircle className="w-6 h-6 text-white" />
                               ) : (
-                                <div className="w-5 h-5 rounded-full border border-slate-300" />
+                                <Plus className="w-5 h-5 text-slate-400" />
                               )}
                             </div>
                           </button>
@@ -427,10 +516,11 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Form Identitas & Tombol Submit Semua */}
                   <form onSubmit={handleBookingSubmit} className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200 space-y-4">
                     <h3 className="text-base font-bold text-slate-800 flex items-center gap-2">
                       <Users className="w-5 h-5 text-indigo-600" />
-                      Lengkapi Data Anak & Orang Tua
+                      3. Lengkapi Data Siswa
                     </h3>
 
                     <div className="grid sm:grid-cols-2 gap-4">
@@ -475,17 +565,17 @@ export default function App() {
 
                     <button
                       type="submit"
-                      disabled={!selectedSession || submitting}
+                      disabled={cart.length === 0 || submitting}
                       className={`w-full py-3.5 rounded-xl font-bold text-white shadow-md transition flex items-center justify-center gap-2 ${
-                        selectedSession && !submitting
+                        cart.length > 0 && !submitting
                           ? 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-200 cursor-pointer' 
                           : 'bg-slate-300 cursor-not-allowed'
                       }`}
                     >
-                      {submitting ? 'Menyimpan ke Cloud...' : selectedSession ? (
-                        <>Konfirmasi & Kunci Jadwal Sekarang <ArrowRight className="w-4 h-4" /></>
+                      {submitting ? 'Menyimpan Semua Jadwal...' : cart.length > 0 ? (
+                        <>Kunci {cart.length} Sesi Terpilih Sekarang <ArrowRight className="w-4 h-4" /></>
                       ) : (
-                        'Silakan Pilih Sesi Jam Terlebih Dahulu'
+                        'Pilih Minimal 1 Sesi Terlebih Dahulu'
                       )}
                     </button>
                   </form>
@@ -495,14 +585,14 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: PORTAL ORTU */}
+        {/* TAB 2: PORTAL CEK JADWAL ORTU */}
         {activeTab === 'parent' && (
           <div className="max-w-2xl mx-auto space-y-6">
             <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 text-center">
               <UserCheck className="w-12 h-12 mx-auto text-indigo-600 mb-2" />
               <h2 className="text-xl font-bold text-slate-800">Cek Jadwal Belajar Anak</h2>
               <p className="text-sm text-slate-500 mt-1 mb-5">
-                Masukkan nomor WhatsApp pendaftaran untuk melihat jadwal aktif secara online.
+                Masukkan nomor WhatsApp untuk melihat semua jadwal yang telah didaftarkan.
               </p>
 
               <form onSubmit={handleParentSearch} className="flex gap-2 max-w-md mx-auto">
@@ -525,7 +615,7 @@ export default function App() {
 
             {parentResults !== null && (
               <div className="space-y-4">
-                <h3 className="font-bold text-slate-700">Hasil Pencarian ({parentResults.length} Jadwal):</h3>
+                <h3 className="font-bold text-slate-700">Hasil Pencarian ({parentResults.length} Sesi Terdaftar):</h3>
                 {parentResults.length === 0 ? (
                   <div className="bg-white p-8 rounded-2xl border text-center text-slate-500">
                     Tidak ditemukan pendaftaran dengan nomor tersebut.
@@ -565,7 +655,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: ADMIN */}
+        {/* TAB 3: ADMIN DASHBOARD */}
         {activeTab === 'admin' && (
           <div>
             {!isAdminLoggedIn ? (
@@ -614,7 +704,7 @@ export default function App() {
                 <div className="flex flex-wrap justify-between items-center gap-3 bg-white p-4 rounded-2xl border shadow-sm">
                   <div>
                     <h2 className="text-lg font-bold text-slate-800">Dashboard Manajemen Bimbel ABE-Q</h2>
-                    <p className="text-xs text-slate-500">Total {bookings.length} Peserta Terdaftar di Cloud Database</p>
+                    <p className="text-xs text-slate-500">Total {bookings.length} Sesi Terdaftar di Cloud Database</p>
                   </div>
                   <div className="flex items-center gap-2">
                     <button 
@@ -737,7 +827,7 @@ export default function App() {
       </main>
 
       <footer className="bg-white border-t py-4 text-center text-xs text-slate-400 mt-6">
-        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Real-time Cloud Connected.
+        © {new Date().getFullYear()} Bimbel ABE-Q BGR UTR. Real-time Multi-Booking Enabled.
       </footer>
     </div>
   );
